@@ -114,15 +114,22 @@ directory = "htmlcov"
 - After writing the `license` line, re-read `pyproject.toml` before committing — some repos have a formatter/linter hook that silently reverts it on save (e.g. back to the bare `"AGPL-3.0"` form or a previous value). Don't assume the edit stuck just because the tool reported success.
 - `dependencies` must be a static list — never `dynamic = ["dependencies"]`
 - Framework deps need a lower bound: `"django>=4.2"` (oldest tested version)
+- No upper bounds in `dependencies` (no `Django<6.0`): they become `Requires-Dist` on PyPI and block every downstream consumer from upgrading. Caps go in `[tool.uv].constraint-dependencies` via `edx_lint write_uv_constraints`. Compare against the last release's `Requires-Dist` (`https://pypi.org/pypi/<dist>/json`) and match it. (feanil on openedx-filters#381, openedx-core#704, auth-backends#444)
+- `include-package-data`: pyproject's default is `true`, and with setuptools-scm that ships every git-tracked file under the package: READMEs, COPYING, `conf/locale/config.yaml`, test data (`exclude-package-data` didn't catch nested test dirs on openedx-events#590). If the old `setup.py` never set `include_package_data=True`, set `[tool.setuptools] include-package-data = false` and list real data files in `package-data`. Either way, diff the built wheel's file list against the last PyPI wheel before committing.
+- `authors = [{name = "Open edX Project", email = "oscm@openedx.org"}]` when the old author was edX/Open edX.
 - Framework classifiers should match the tested versions (e.g. `Framework :: Django :: 4.2`, `Framework :: Django :: 5.2`)
 - No `root` in `[tool.setuptools_scm]` (unlike sample-plugin which is a subdirectory)
 - `[tool.uv]` must include `package = true`
 - If the repo already uses ruff, carry over `[tool.ruff]` (`line-length = 120`, `target-version`), `[tool.ruff.lint]` (expanded `select`, `ignore = ["E501"]`), `[tool.ruff.lint.isort]` (`known-third-party`), and `[tool.ruff.format]` (`quote-style = "double"`, `indent-style = "space"`). Skip entirely if the repo doesn't use ruff — don't introduce it.
 
-**Changelog setup (do this in Phase 1, not Phase 3):**
-`tag_format` is **N/A for openedx repos** — org convention is always `v{version}` tags, which is PSR's default, so don't set `tag_format` and don't spend time checking git tags for it.
-
-Add `.. changelog-insertion-marker` to `CHANGELOG.rst` right before the first changelog entry (after the preamble/header block). PSR inserts new release entries above this flag on each release.
+**Tags and changelog:**
+- openedx uses `v{version}` tags, which is PSR's default. Still check the live tags: a `v` tag must exist for the latest PyPI version (`gh api repos/openedx/<repo>/tags`). If the repo only has bare tags (`1.2.3`), a maintainer has to cut a `v`-prefixed bridging release before merge, or PSR won't find the previous release. Setting it explicitly is fine; the merged repos do, with feanil's wording:
+  ```toml
+  [tool.semantic_release]
+  # Explicitly set the tag format (same as default).
+  tag_format = "v{version}"
+  ```
+- Leave `CHANGELOG.rst` as it is. Release notes go on the GitHub release (`changelog: "false"` in `release.yml`), so don't add a `.. changelog-insertion-marker` or `[tool.semantic_release.changelog]`, never delete old entries, and keep the file shipping in the sdist (feanil on DoneXBlock#388).
 
 The `build_command`, `allow_zero_version`, and `major_on_zero` keys under `[tool.semantic_release]` are added in Phase 3.
 
@@ -194,6 +201,8 @@ conflicts = [[{group = "test"}, {group = "django42"}]]  # both pin Django
 - Do NOT add ruff unless the repo already uses it.
 - If `setup.cfg` had `[pycodestyle]`, migrate to `tox.ini` (pycodestyle reads tox.ini; pyproject.toml not supported).
 - If bumping a framework's version range drops support for an older Python, bump `requires-python` accordingly and remove that Python from the tox envlist and CI matrix.
+- edx-lint 6.2.0's PII checker crashes pylint on a `pylintrc` without `pii-terms`. If the fresh lock resolves 6.2+, regenerate it: `uv run --with edx-lint edx_lint write pylintrc`.
+- Declare every conflicting pair in `[tool.uv].conflicts` explicitly (each group that includes `test`, against `django42`), as openedx-ledger does. Otherwise uv derives them, the order varies by uv version, and `uv lock --check` passes or fails depending on who wrote the lock.
 
 ### Commands
 
@@ -244,9 +253,11 @@ Keep `allowlist_externals = make` in every env that calls `make`.
 
 ### `Makefile`
 
-**Makefile targets must NOT use the `uv run` prefix** (openedx/public-engineering#506). The Makefile assumes the venv is already activated (e.g. via `uv sync` + direct `source .venv/bin/activate`, or because the caller already ran `uv run make ...`). `lint`/`test`/`docs`/`quality`/`pii_check` targets delegate to `tox -e <env>` instead of inlining commands — tox's `uv-venv-lock-runner` handles the group/venv selection per env, so duplicating that logic in the Makefile just gives you two places to keep in sync.
+**Makefile targets must NOT use the `uv run` prefix** (openedx/public-engineering#506). The Makefile assumes the venv is already activated (e.g. via `uv sync` + direct `source .venv/bin/activate`, or because the caller already ran `uv run make ...`). `lint`/`test`/`docs`/`quality`/`pii_check` targets delegate to `tox -e <env>` instead of inlining commands — tox's `uv-venv-lock-runner` handles the group/venv selection per env, so duplicating that logic in the Makefile just gives you two places to keep in sync. If a repo already goes the other way (tox envs call `make`), keep it: feanil prefers tox calling the Makefile in the long run but doesn't want migration PRs to flip either direction (2026-09-28).
 
 The **only** exception is `uv run --with <pkg>` in the `upgrade` target. Do not add `uv run` anywhere else in the Makefile — in particular, never put it inside a target that tox itself invokes (e.g. `clean`'s `coverage erase`): `uv run` re-syncs default dependency groups, which corrupts the Django version matrix when it runs inside an already-selected tox env.
+
+No `uv sync` in any target except `requirements`: a target that syncs one group (e.g. `docs: uv sync --group doc`) shrinks the developer's venv and removes tools a later target needs (feanil on openedx-ledger#242). Put the missing group in `dev` instead.
 
 ```makefile
 upgrade:
@@ -297,7 +308,7 @@ jobs:
     steps:
     - uses: actions/checkout@<sha> # vX.Y.Z
     - name: Setup uv
-      uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+      uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
       with:
         enable-cache: true
         python-version: "${{ matrix.python-version }}"
@@ -318,10 +329,10 @@ jobs:
 
 Other CI rules:
 - Pin all actions to full commit SHAs: `@<sha> # vX.Y.Z`
-- Job `name: ${{ matrix.toxenv }}` for identifiable matrix jobs
+- Job `name: ${{ matrix.toxenv }}` for identifiable matrix jobs, **unless** branch protection requires checks by their old names. Check first: `gh api repos/openedx/<repo>/branches/<default>/protection --jq .required_status_checks.contexts`. A renamed job never reports the required name, so the PR stays blocked with every check green (enterprise-access#1015 requires `tests (3.12, pinned)`). If anything is required, keep the old job name and matrix values.
 - Add `workflow_call:` trigger so `release.yml` can call this workflow. **Keep** `push: [master]` (or `[main]`) too — it's what runs CI on direct pushes (dependabot merges, hotfixes) independently of the release flow; it does not conflict with `workflow_call`.
 - Add `permissions: contents: read` to the job.
-- Both `uv sync --group ci` and `uv run tox` must use `--locked` — without it, a `uv.lock` that's drifted from `pyproject.toml` gets silently re-resolved in CI instead of failing.
+- `uv sync --group ci` must use `--locked` — without it, a `uv.lock` that's drifted from `pyproject.toml` gets silently re-resolved in CI instead of failing. `uv run --locked tox` is the reference form; a plain `uv run tox` right after the locked sync is also accepted, since the sync step has already failed on a stale lock.
 
 **Do NOT touch `pypi-publish.yml`** in Phase 2 — it will be deleted in Phase 3.
 
@@ -435,7 +446,7 @@ jobs:
             dist/*
 
       - name: Upload | Distribution Artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: steps.release.outputs.released == 'true'
         with:
           name: distribution-artifacts
@@ -461,7 +472,8 @@ jobs:
 
     steps:
       - name: Setup | Download Build Artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        id: artifact-download
         with:
           name: distribution-artifacts
           path: dist
@@ -483,13 +495,15 @@ jobs:
 - Delete `pypi-publish.yml` — release.yml replaces it
 - Create `commitlint.yml` if it doesn't exist
 - Remind user to configure OIDC trusted publisher on PyPI (workflow: `release.yml`)
-- If the repo has Sphinx docs, update `.readthedocs.yaml` to install via `method: uv`, `command: sync`, `groups: [doc]` instead of pip — this uses `uv.lock` and avoids a heavy pip dependency resolution on every RTD build. No `[project.optional-dependencies].docs` needed with the uv method.
+- If the repo has Sphinx docs, update `.readthedocs.yaml` to install via `method: uv`, `command: sync`, `groups: [doc]` instead of pip — this uses `uv.lock` and avoids a heavy pip dependency resolution on every RTD build. No `[project.optional-dependencies].docs` needed with the uv method. Keep the `sphinx:` block and `fail_on_warning` if they were there, and pin `build.os` to a fixed version (`ubuntu-26.04`) rather than `ubuntu-lts-latest`, which RTD warns can break builds when it moves (event-bus-kafka#349).
 
 ---
 
 ## Phase 4 — src layout
 
 Skip if `src/<package>/` already exists.
+
+Also skip it if anything outside the repo reads files by their in-repo path. Check openedx-translations first: its extraction workflow skips `*/src/*`, and its `transifex.yml` hard-codes paths like `translations/<repo>/<package>/conf/locale/` (edx-bulk-grades#179 and completion#466 stayed flat for this reason). Then `gh search code "<repo>/master/<package>/" --owner openedx` for raw-file fetches. Say in the PR why Phase 4 was skipped.
 
 1. `git mv <package>/ src/<package>/`
 2. `pyproject.toml` — add `where = ["src"]` to `[tool.setuptools.packages.find]`
@@ -525,6 +539,19 @@ One commit per phase, conventional format:
 
 Before pushing: run `make quality` — must pass with pylint 10.00/10.
 
+Then compare the build with the last release:
+```bash
+uv lock --check
+uv build
+curl -s https://pypi.org/pypi/<dist>/json > meta.json   # save to a file; zsh's echo mangles the JSON
+diff <(unzip -Z1 old.whl | grep -v dist-info/ | sort) <(unzip -Z1 dist/*.whl | grep -v dist-info/ | sort)
+diff <(unzip -p old.whl '*.dist-info/METADATA' | grep ^Requires-Dist | sort) \
+     <(unzip -p dist/*.whl '*.dist-info/METADATA' | grep ^Requires-Dist | sort)
+tar tzf dist/*.tar.gz | grep -iE 'CHANGELOG|README|LICENSE'
+uvx twine check dist/*
+```
+The file lists should match except for differences you can explain in the PR (e.g. test files that shouldn't have shipped). Diff the lists, not just the counts.
+
 Push to fork, open PR against the **upstream repo** (not the fork):
 ```bash
 git push origin modernize-python-tooling
@@ -543,11 +570,14 @@ Phase 1
 [ ] license uses AGPL-3.0-only or AGPL-3.0-or-later (matching the original classifier) — never bare "AGPL-3.0"
 [ ] license-files includes NOTICE if the repo has one
 [ ] [tool.setuptools.packages.find] excludes test subpackages: exclude = ["*.tests", "*.tests.*"]
+[ ] No upper bounds in [project].dependencies; Requires-Dist matches the last PyPI release
+[ ] include-package-data set so the wheel's file list matches the last PyPI wheel
+[ ] authors = Open edX Project <oscm@openedx.org> (if the old author was edX/Open edX)
 [ ] __version__: removed entirely if unused; if kept, use importlib.metadata without try/except
 [ ] setup.py / setup.cfg / .coveragerc deleted
 [ ] fail_under only if original .coveragerc had it
-[ ] CHANGELOG.rst: .. changelog-insertion-marker added before first entry
-[ ] tag_format: N/A for openedx repos — PSR default v{version} is always correct, don't set it
+[ ] CHANGELOG.rst left as-is: no insertion marker, no deleted entries, still in the sdist
+[ ] A v-tag exists for the latest PyPI version (checked live); tag_format = "v{version}" optional
 
 Phase 2
 [ ] dependency-groups in pyproject.toml (test-base/test/django42/quality/doc/ci/dev)
@@ -556,9 +586,10 @@ Phase 2
 [ ] edx_lint write_uv_constraints run, uv.lock committed
 [ ] requirements/ deleted
 [ ] tox.ini: tox-uv>=1, uv-venv-lock-runner, dependency_groups
-[ ] Makefile: NO uv run prefix anywhere except `uv run --with <pkg>` in upgrade; quality/test/docs targets delegate to `tox -e <env>`; clean uses bare `coverage erase`
+[ ] Makefile: NO uv run prefix anywhere except `uv run --with <pkg>` in upgrade; no uv sync except in requirements; quality/test/docs targets delegate to `tox -e <env>` (keep a repo's existing tox→make direction); clean uses bare `coverage erase`
+[ ] pylintrc regenerated if the lock resolves edx-lint 6.2+
 [ ] CI: setup-uv SHA-pinned, no setup-python, npm install (if JS assets), uv sync --group ci --locked, uv run --locked tox
-[ ] CI: matrix name: ${{ matrix.toxenv }}, workflow_call: trigger added, push: [master] KEPT (not removed), permissions: contents: read on the job
+[ ] CI: required status checks checked before renaming jobs; workflow_call: trigger added, push: [master] KEPT (not removed), permissions: contents: read on the job
 [ ] pypi-publish.yml untouched (deleted in Phase 3)
 
 Phase 3
@@ -568,13 +599,14 @@ Phase 3
 [ ] release.yml: checkout step named "Setup | Checkout Repository on Release Branch", no fetch-depth: 0; reset step named "Setup | Force release branch to be at workflow sha" using `run: |`
 [ ] release.yml: git_committer_name "github-actions" / git_committer_email "actions@users.noreply.github.com" (no [bot] suffix)
 [ ] release.yml: PSR action pinned to the SHA/version currently on sample-plugin's release.yml (don't reuse an old pin from memory)
-[ ] release.yml: vcs_release: "false", gh release create --verify-tag with printf release notes; upload-artifact@043fb46d # v7.0.1 (uses: before if:, path with no trailing slash), download-artifact@3e5f45b2 # v8.0.1 (pinned SHAs); pypa@dc37677b # v1.14.2 step named "Publish to PyPi"; publish job if includes github.ref_name check matching the release job's branch; released output has || 'false' fallback
+[ ] release.yml: vcs_release: "false", gh release create --verify-tag with printf release notes; upload-artifact@cf430e03 # v7.0.2 (uses: before if:, path with no trailing slash), download-artifact@9000827c # v8.0.2 (pinned SHAs, as on sample-plugin today); pypa@dc37677b # v1.14.2 step named "Publish to PyPi"; publish job if includes github.ref_name check matching the release job's branch; released output has || 'false' fallback
 [ ] pypi-publish.yml deleted
 [ ] commitlint.yml exists
-[ ] .readthedocs.yaml uses method: uv / command: sync / groups: [doc] (if repo has Sphinx docs)
+[ ] .readthedocs.yaml uses method: uv / command: sync / groups: [doc], build.os pinned (if repo has Sphinx docs)
 [ ] User reminded to configure OIDC trusted publisher on PyPI
 
 Phase 4
+[ ] Nothing external reads in-repo paths (openedx-translations transifex.yml, raw-file fetches); otherwise skip and say why
 [ ] Package moved to src/<package>/
 [ ] pyproject.toml: where = ["src"]
 [ ] pyproject.toml: [tool.coverage.run] source_pkgs (not source) — required so default-label test discovery working (or not) doesn't silently zero out coverage
@@ -583,6 +615,9 @@ Phase 4
 [ ] MANIFEST.in paths updated
 [ ] uv.lock regenerated
 [ ] uv run tox -e quality passes
+
+Before pushing
+[ ] uv lock --check clean; wheel file list and Requires-Dist diffed against the last PyPI release; sdist still has CHANGELOG/README/LICENSE; twine check passes
 
 Review rounds
 [ ] No unrequested "for consistency" or "just in case" changes in the latest commits
