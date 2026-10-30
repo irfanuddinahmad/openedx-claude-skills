@@ -307,11 +307,9 @@ clean:
 
 ```yaml
 on:
-  push:
-    branches: [master]    # KEEP — CI still needs to run on direct pushes
   pull_request:
     branches: ['**']
-  workflow_call:          # lets release.yml call this workflow and reuse its result
+  workflow_call:          # release.yml runs this on every push to master
 
 jobs:
   run_tests:
@@ -344,7 +342,8 @@ jobs:
 Other CI rules:
 - Pin all actions to full commit SHAs: `@<sha> # vX.Y.Z`
 - Job `name: ${{ matrix.toxenv }}` for identifiable matrix jobs, **unless** branch protection requires checks by their old names. Check first: `gh api repos/openedx/<repo>/branches/<default>/protection --jq .required_status_checks.contexts`. A renamed job never reports the required name, so the PR stays blocked with every check green (enterprise-access#1015 requires `tests (3.12, pinned)`). If anything is required, keep the old job name and matrix values.
-- Add `workflow_call:` trigger so `release.yml` can call this workflow. **Keep** `push: [master]` (or `[main]`) too — it's what runs CI on direct pushes (dependabot merges, hotfixes) independently of the release flow; it does not conflict with `workflow_call`.
+- Add `workflow_call:` and drop `push: [master]` (or `[main]`), as sample-plugin's `ci.yml` does. `release.yml` runs on every push to the default branch and calls this workflow through `run_ci`, so keeping `push:` would test every merge twice.
+- That moves master's CI runs under the Release workflow, so a README badge pointing at `ci.yml` (`workflows/Python%20CI/badge.svg` or `actions/workflows/ci.yml/badge.svg`) stops updating and keeps showing its last pre-migration result. Point it at `actions/workflows/release.yml/badge.svg?branch=master`, or remove it. Also repoint or remove any badge for the deleted `pypi-publish.yml`.
 - Add `permissions: contents: read` to the job.
 - Every `uv sync` and `uv run` in every workflow (CI and migration-check workflows alike) uses `--locked`, so a `uv.lock` that's drifted from `pyproject.toml` fails the build instead of being re-resolved on the runner (feanil, 2026-10-29). `uv run --with <tool>` one-offs are the only exception.
 - If the workflow has a `concurrency` block, use sample-plugin's form once `workflow_call:` is added. Otherwise a push to the default branch and the release's `run_ci` share a group and `cancel-in-progress` can cancel the release:
@@ -624,7 +623,7 @@ Phase 2
 [ ] pylintrc regenerated if the lock resolves edx-lint 6.2+
 [ ] CI: setup-uv SHA-pinned, no setup-python, npm install (if JS assets), --locked on every uv sync / uv run in every workflow, no fetch-depth: 0 on test checkouts
 [ ] CI: an existing concurrency block uses sample-plugin's pull_request/run_id form once workflow_call: is added
-[ ] CI: required status checks checked before renaming jobs; workflow_call: trigger added, push: [master] KEPT (not removed), permissions: contents: read on the job
+[ ] CI: required status checks checked before renaming jobs; workflow_call: trigger added, push: [master] dropped (release.yml's run_ci covers it), ci.yml / pypi-publish.yml README badges repointed or removed, permissions: contents: read on the job
 [ ] pypi-publish.yml untouched (deleted in Phase 3)
 
 Phase 3
