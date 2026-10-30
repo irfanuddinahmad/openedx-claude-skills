@@ -43,7 +43,7 @@ Replaces `pip-compile` / `requirements/*.txt` with `uv` and a lockfile.
 | `pyproject.toml` — `[dependency-groups]` | Adds standard groups: `test-base`, `test` (current Django), legacy version group (e.g. `django42`), `quality`, `doc`, `ci` (tox + tox-uv only), `dev` |
 | `pyproject.toml` — `[tool.uv]` | `conflicts` allows two Django version groups to coexist in a single `uv.lock`; `default-groups = []` so `uv sync --group ci` doesn't implicitly pull in the full `dev` superset |
 | `pyproject.toml` — `[tool.edx_lint]` | `uv_constraints = []` added — the *only* place for repo-specific constraint overrides; never edit `[tool.uv].constraint-dependencies` directly (machine-managed) |
-| `uv.lock` | Generated via `uv lock` |
+| `uv.lock` | Seeded from the default branch's `requirements/*.txt` pins, so the migration installs exactly what ran before; upgrades come with the first `make upgrade` |
 | `requirements/` | Deleted |
 | `tox.ini` | `requires = tox-uv>=1`; runner = `uv-venv-lock-runner`; uses `dependency_groups =` instead of `deps =` |
 | `Makefile` | `upgrade` → `uv run --with edx-lint edx_lint write_uv_constraints ...` then `uv lock --upgrade`; `requirements` → `uv sync --group dev`; `quality`/`test`/`docs`/`pii_check` targets **delegate to `tox -e <env>`** rather than inlining `uv run --group ...` commands (a repo whose tox envs already call `make` keeps that direction); no `uv sync` in any target except `requirements`; `clean` uses a bare `coverage erase`. The Makefile must never add a `uv run` prefix anywhere except `uv run --with <pkg>` in `upgrade` — `uv run` inside a target that tox itself invokes re-syncs default groups and corrupts the Django version matrix ([openedx/public-engineering#506](https://github.com/openedx/public-engineering/issues/506)) |
@@ -80,6 +80,7 @@ Optional; skipped if `src/<package>/` already exists. Moves the package into `sr
 | `pyproject.toml` — `[tool.coverage.run]` | `source = [...]` changed to **`source_pkgs = [...]`**. This isn't cosmetic: Django's default (label-less) test discovery can't recurse past `src/` (`unittest`'s loader refuses to recurse into any directory without an `__init__.py`, and `src/` deliberately has none). `source_pkgs` locates the package via its import `__path__` instead of a filesystem path, independent of how the test runner was invoked. Getting this wrong — or invoking the test runner without an explicit package label — can silently drop real test coverage to near zero while CI stays green |
 | `tox.ini` / `Makefile` | Filesystem paths updated to `src/<package>/...` |
 | `MANIFEST.in` | Paths updated to `src/<package>/...` |
+| Other path references | Symlinks, docs directives/links/`linkcode_resolve`, `.tx/config` and root-anchored ignore files updated |
 | `uv.lock` | Regenerated |
 
 ---

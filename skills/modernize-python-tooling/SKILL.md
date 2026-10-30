@@ -213,6 +213,20 @@ uv run --with edx-lint edx_lint write_uv_constraints pyproject.toml
 uv lock   # generate uv.lock
 ```
 
+**Seed `uv.lock` from the base branch's pins — never ship a fresh resolve.** A migration must not change what gets installed (feanil on enterprise-access#1015: a fresh lock pulled in 58 of 117 production upgrades the bot PRs hadn't merged yet). The first `make upgrade` after merge takes the upgrades.
+
+1. Collect every `name==version` from the default branch's `requirements/*.txt` (`git show origin/master:requirements/<f>.txt`). Skip `pip.txt`, `pip-tools.txt` and `*constraints.txt`, and factor files that tox layers on top (`django.txt`, `celeryNN.txt`).
+2. Add them temporarily to `[tool.uv].constraint-dependencies`, run `uv lock`, restore `pyproject.toml`, run `uv lock` again. uv keeps the locked versions as preferences, so the second lock keeps the base branch's versions.
+3. Verify each group: `uv export --frozen --no-hashes --no-emit-project --no-default-groups --only-group <g>` against `requirements/<g>.txt`. Expected differences only: tooling the migration adds (tox-uv, setuptools-scm), packages that left the graph (pip-tools, wheel), platform-only markers (colorama), and packages the base branch itself pins at two versions in different files (e.g. docutils in doc.txt vs quality.txt).
+
+Edge cases:
+- A package a conflict group requires directly (Django in a `django42` setup) can't be a global `==` pin: it would make the other group unresolvable. Put `Django==<base pin>` temporarily in each group on the other side of the conflict instead.
+- A pin that needs a newer Python than `requires-python` allows (e.g. `sphinx==9.1.0` with `>=3.11`) needs a marker: `"sphinx==9.1.0; python_version >= '3.12'"`.
+- If the base branch's CI never ran a group's environment (enterprise-access never ran Django 4.2), drop the group and its `conflicts` instead of locking an environment nobody tested.
+- A group that hard-pins old versions of shared tools (edx-enterprise-data's `test-reporting`: `pytest==8.0.2`, `ddt==1.1.2`) leaks them into every group unless it's declared in `conflicts`, and must not be included by `dev`.
+- A repo that syncs pins from openedx-platform (edx-enterprise) seeds that block from its own committed snapshot (`requirements/edx-platform-constraints.txt` on the base branch), not today's platform.
+- Rerun `edx_lint write_uv_constraints` first. Stale constraints let `social-auth-app-django` 6 into enterprise-access, which broke login.
+
 Then delete `requirements/`.
 
 ### `tox.ini`
@@ -332,7 +346,14 @@ Other CI rules:
 - Job `name: ${{ matrix.toxenv }}` for identifiable matrix jobs, **unless** branch protection requires checks by their old names. Check first: `gh api repos/openedx/<repo>/branches/<default>/protection --jq .required_status_checks.contexts`. A renamed job never reports the required name, so the PR stays blocked with every check green (enterprise-access#1015 requires `tests (3.12, pinned)`). If anything is required, keep the old job name and matrix values.
 - Add `workflow_call:` trigger so `release.yml` can call this workflow. **Keep** `push: [master]` (or `[main]`) too — it's what runs CI on direct pushes (dependabot merges, hotfixes) independently of the release flow; it does not conflict with `workflow_call`.
 - Add `permissions: contents: read` to the job.
-- `uv sync --group ci` must use `--locked` — without it, a `uv.lock` that's drifted from `pyproject.toml` gets silently re-resolved in CI instead of failing. `uv run --locked tox` is the reference form; a plain `uv run tox` right after the locked sync is also accepted, since the sync step has already failed on a stale lock.
+- Every `uv sync` and `uv run` in every workflow (CI and migration-check workflows alike) uses `--locked`, so a `uv.lock` that's drifted from `pyproject.toml` fails the build instead of being re-resolved on the runner (feanil, 2026-10-29). `uv run --with <tool>` one-offs are the only exception.
+- If the workflow has a `concurrency` block, use sample-plugin's form once `workflow_call:` is added. Otherwise a push to the default branch and the release's `run_ci` share a group and `cancel-in-progress` can cancel the release:
+  ```yaml
+  concurrency:
+    group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+    cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  ```
+- Tests don't need tag history: don't add `fetch-depth: 0` to the test checkout. A shallow checkout builds the package as `fallback_version`, which is fine for tests.
 
 **Do NOT touch `pypi-publish.yml`** in Phase 2 — it will be deleted in Phase 3.
 
@@ -496,6 +517,8 @@ jobs:
 - Create `commitlint.yml` if it doesn't exist
 - Remind user to configure OIDC trusted publisher on PyPI (workflow: `release.yml`)
 - If the repo has Sphinx docs, update `.readthedocs.yaml` to install via `method: uv`, `command: sync`, `groups: [doc]` instead of pip — this uses `uv.lock` and avoids a heavy pip dependency resolution on every RTD build. No `[project.optional-dependencies].docs` needed with the uv method. Keep the `sphinx:` block and `fail_on_warning` if they were there, and pin `build.os` to a fixed version (`ubuntu-26.04`) rather than `ubuntu-lts-latest`, which RTD warns can break builds when it moves (event-bus-kafka#349).
+- Remove the manual release steps that PSR now does: "Version bumped", "Changelog record added", "Create a tag", "Create a release on GitHub" and the PyPI check in `.github/PULL_REQUEST_TEMPLATE.md`; "bump `__version__`" / "tag and Travis releases" sections in `README.rst` (it's the PyPI description too). Say instead that merges to the default branch are released automatically from the conventional commit types, with notes on GitHub Releases.
+- Replace "create/activate a virtualenv, then `make requirements`" in `README.rst` and `docs/getting_started.rst`/`docs/testing.rst` (the cookiecutter text) with the uv flow: `make requirements` creates `.venv`, then `source .venv/bin/activate`. `uv sync` ignores an activated virtualenv, so the old flow fails at `make test`.
 
 ---
 
@@ -513,8 +536,12 @@ Also skip it if anything outside the repo reads files by their in-repo path. Che
 6. Settings files — update `LOCALE_PATHS` / `root()` calls that reference the package directory
 7. `MANIFEST.in` — update paths to `src/<package>/static` etc.; drop any `include requirements/...` lines
 8. If the test runner (e.g. a Django `test.py`) is invoked without an explicit app/package label anywhere (Makefile, tox, CI), add the label explicitly now — see point 3's note on why label-less discovery breaks under src/ layout
-9. Run `uv lock` (pyproject.toml changed)
-10. Run `make quality` **and** `make test` (or the tox env that runs the test suite) and confirm the test count/coverage didn't silently drop before committing — a passing `make quality` alone won't catch a test-discovery regression
+9. Non-Python references to the old path. Search every tracked file outside `src/` for `<package>/`, and fix what isn't an import path:
+   - symlinks: `git ls-files -s | awk '$1==120000{print $4}'`, then check each target still exists (edx-enterprise's root `locale` -> `enterprise/conf/locale` broke `make extract_translations`)
+   - docs: Sphinx directives with repo-relative paths (`:folder_path:`), `linkcode_resolve` in `docs/conf.py` (go up one more directory for `src/`), and `github.com/<org>/<repo>/blob/<branch>/<package>/` links (commit-pinned permalinks are fine)
+   - `.tx/config`, and `.gitignore`/`.jshintignore` entries anchored at the root (a stale `<package>/static/bundles/*.js` stops ignoring built bundles)
+10. Run `uv lock` (pyproject.toml changed)
+11. Run `make quality` **and** `make test` (or the tox env that runs the test suite) and confirm the test count/coverage didn't silently drop before committing — a passing `make quality` alone won't catch a test-discovery regression
 
 **Do NOT change:**
 - `@patch('package.module')` in tests — Python import paths, not filesystem paths
@@ -584,11 +611,13 @@ Phase 2
 [ ] [tool.edx_lint] section exists with uv_constraints (even if empty)
 [ ] [tool.uv]: package=true, default-groups=[], conflicts declared for version-matrix groups
 [ ] edx_lint write_uv_constraints run, uv.lock committed
+[ ] uv.lock seeded from the base branch's requirements/*.txt; each group's uv export diffed against its .txt (only explainable differences)
 [ ] requirements/ deleted
 [ ] tox.ini: tox-uv>=1, uv-venv-lock-runner, dependency_groups
 [ ] Makefile: NO uv run prefix anywhere except `uv run --with <pkg>` in upgrade; no uv sync except in requirements; quality/test/docs targets delegate to `tox -e <env>` (keep a repo's existing tox→make direction); clean uses bare `coverage erase`
 [ ] pylintrc regenerated if the lock resolves edx-lint 6.2+
-[ ] CI: setup-uv SHA-pinned, no setup-python, npm install (if JS assets), uv sync --group ci --locked, uv run --locked tox
+[ ] CI: setup-uv SHA-pinned, no setup-python, npm install (if JS assets), --locked on every uv sync / uv run in every workflow, no fetch-depth: 0 on test checkouts
+[ ] CI: an existing concurrency block uses sample-plugin's pull_request/run_id form once workflow_call: is added
 [ ] CI: required status checks checked before renaming jobs; workflow_call: trigger added, push: [master] KEPT (not removed), permissions: contents: read on the job
 [ ] pypi-publish.yml untouched (deleted in Phase 3)
 
@@ -604,6 +633,7 @@ Phase 3
 [ ] commitlint.yml exists
 [ ] .readthedocs.yaml uses method: uv / command: sync / groups: [doc], build.os pinned (if repo has Sphinx docs)
 [ ] User reminded to configure OIDC trusted publisher on PyPI
+[ ] PR template, README and docs no longer describe manual version bumps/tags/releases or a self-made virtualenv
 
 Phase 4
 [ ] Nothing external reads in-repo paths (openedx-translations transifex.yml, raw-file fetches); otherwise skip and say why
@@ -613,6 +643,7 @@ Phase 4
 [ ] Test runner is invoked with an explicit app/package label everywhere (Makefile, tox, CI) — never label-less, since src/ blocks unittest's default discovery
 [ ] tox.ini + Makefile filesystem paths updated
 [ ] MANIFEST.in paths updated
+[ ] Symlinks, docs paths/links/linkcode_resolve, .tx/config and root-anchored ignore files updated
 [ ] uv.lock regenerated
 [ ] uv run tox -e quality passes
 
