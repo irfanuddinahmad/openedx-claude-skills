@@ -24,12 +24,12 @@ Moves all package metadata out of `setup.cfg` / `setup.py` into a single `pyproj
 | What changes | Details |
 |---|---|
 | `pyproject.toml` | `[build-system]` uses `requires = ["setuptools", "setuptools-scm>8.1"]`; `[project]` has static `dependencies` list; `dynamic = ["version"]` only |
-| `[tool.setuptools_scm]` | `version_scheme = "only-version"`, `local_scheme = "no-local-version"` — prevents dirty suffixes being rejected by PyPI. `fallback_version` only for repos with no git tags yet |
+| `[tool.setuptools_scm]` | `version_scheme = "only-version"`, `local_scheme = "no-local-version"` — prevents dirty suffixes being rejected by PyPI. `fallback_version = "0.0.0"` for shallow checkouts |
 | `[tool.uv]` | `package = true` added |
 | `license` | Converted to SPDX string format (PEP 639) — checked against the repo's *original* `License :: OSI Approved :: ...` classifier, not assumed: no "or later" in the classifier → `license = "AGPL-3.0-only"`; "or later" → `"AGPL-3.0-or-later"`. Never the deprecated bare `"AGPL-3.0"` form. `license-files = ["LICENSE", "NOTICE"]` (include `NOTICE` if the repo has one) |
-| `[tool.setuptools.packages.find]` | `exclude = ["*.tests", "*.tests.*"]` so test subpackages don't ship in the wheel (a bare `"*tests"` only matches names *ending* in `tests` — nested fixture packages still leak through) |
+| `[tool.setuptools.packages.find]` | `exclude = ["*tests*"]` so test subpackages don't ship in the wheel (a bare `"*tests"` only matches names *ending* in `tests` — nested fixture packages still leak through) |
 | `[tool.coverage.run/report/html]` | Coverage config moves here from `.coveragerc`, which is deleted |
-| `__version__` in `__init__.py` | Removed entirely if nothing imports it; if genuinely needed at runtime, read via `importlib.metadata.version(...)` with no `try/except` fallback (a silent fallback masks an uninstalled package) |
+| `__version__` in `__init__.py` | Kept, read via `importlib.metadata.version(...)` with no `try/except` fallback (a silent fallback masks an uninstalled package) |
 | `setup.py` / `setup.cfg` / `.coveragerc` | Deleted |
 
 ---
@@ -46,7 +46,7 @@ Replaces `pip-compile` / `requirements/*.txt` with `uv` and a lockfile.
 | `uv.lock` | Seeded from the default branch's `requirements/*.txt` pins, so the migration installs exactly what ran before; upgrades come with the first `make upgrade` |
 | `requirements/` | Deleted |
 | `tox.ini` | `requires = tox-uv>=1`; runner = `uv-venv-lock-runner`; uses `dependency_groups =` instead of `deps =` |
-| `Makefile` | `upgrade` → `uv run --with edx-lint edx_lint write_uv_constraints ...` then `uv lock --upgrade`; `requirements` → `uv sync --group dev`; `quality`/`test`/`docs`/`pii_check` targets **delegate to `tox -e <env>`** rather than inlining `uv run --group ...` commands (a repo whose tox envs already call `make` keeps that direction); no `uv sync` in any target except `requirements`; `clean` uses a bare `coverage erase`. The Makefile must never add a `uv run` prefix anywhere except `uv run --with <pkg>` in `upgrade` — `uv run` inside a target that tox itself invokes re-syncs default groups and corrupts the Django version matrix ([openedx/public-engineering#506](https://github.com/openedx/public-engineering/issues/506)) |
+| `Makefile` | `upgrade` → `uv run --with edx-lint edx_lint write_uv_constraints ...` then `uv lock --upgrade`; `requirements` → `uv sync --group dev`; the Makefile↔tox calling direction is left as the repo had it; no `uv sync` in any target except `requirements`; `clean` uses a bare `coverage erase`. The Makefile must never add a `uv run` prefix anywhere except `uv run --with <pkg>` in `upgrade` — `uv run` inside a target that tox itself invokes re-syncs default groups and corrupts the Django version matrix ([openedx/public-engineering#506](https://github.com/openedx/public-engineering/issues/506)) |
 | CI workflows | `astral-sh/setup-uv` step added (SHA-pinned, no separate `setup-python`); `pip install -r requirements/ci.txt` → `uv sync --group ci --locked`; bare `tox` → `uv run --locked tox -e ${{ matrix.toxenv }}` (the `--locked` on the sync makes a drifted `uv.lock` fail CI instead of silently re-resolving); job names kept if branch protection requires them; job gets `permissions: contents: read`; `workflow_call:` trigger added so `release.yml` can reuse it |
 
 > If the repo already uses `[project.optional-dependencies]` instead of `[dependency-groups]`, `tox.ini` can use `extras =` instead of `dependency_groups =`. The Django version matrix requires `[dependency-groups]` with `[tool.uv].conflicts` to work correctly.
@@ -59,13 +59,13 @@ Automates versioning, changelog, and PyPI publishing via GitHub Actions.
 
 | What changes | Details |
 |---|---|
-| `pyproject.toml` — `[tool.semantic_release]` | `build_command` uses `python -m build` (not `uv build` — PSR's action environment has no uv) and exports `SETUPTOOLS_SCM_PRETEND_VERSION=$NEW_VERSION` before building so the version is set correctly at build time. `allow_zero_version`/`major_on_zero` only added for repos still on 0.x |
+| `pyproject.toml` — `[tool.semantic_release]` | `build_command` uses `python -m build` (not `uv build` — PSR's action environment has no uv) and exports `SETUPTOOLS_SCM_PRETEND_VERSION=$NEW_VERSION` before building so the version is set correctly at build time. `major_on_zero = false` and `allow_zero_version = true` |
 | `.github/workflows/release.yml` | Rewritten to match [`openedx/sample-plugin`](https://github.com/openedx/sample-plugin/blob/main/.github/workflows/release.yml)'s reference exactly: a `run_ci` job calls `ci.yml` via `workflow_call` (no `secrets: inherit`, no `permissions` block on it); `release` job checks out, force-resets to the triggering sha, runs PSR with `vcs_release: "false"`, then `gh release create` attaches the built `dist/` as release assets (required for repos with immutable releases, since assets can't be attached after publish); `publish_to_pypi` job uses OIDC (`contents: read` + `id-token: write`, no token secret) |
 | `.github/workflows/ci.yml` | `push: [main]` (or `[master]`) is **kept**, not removed, even after adding `workflow_call:` — it's what runs CI on direct pushes (dependabot merges, hotfixes) independently of the release flow, and doesn't conflict with `workflow_call` |
 | `.github/workflows/commitlint.yml` | Enforces conventional commit format on PRs |
 | `.readthedocs.yaml` | If the repo has Sphinx docs: installs via `method: uv` / `command: sync` / `groups: [doc]` instead of pip, using `uv.lock` |
 
-> PyPI trusted publisher (OIDC) must be configured manually in PyPI project settings before the publish job will work. If the repo already uses a `PYPI_UPLOAD_TOKEN` secret and publishing is working, leave the token-based auth in place.
+> PyPI trusted publisher (OIDC) must be configured manually in PyPI project settings before the publish job will work. Publishing is OIDC-only; the old token-based publish workflow is deleted.
 
 ---
 

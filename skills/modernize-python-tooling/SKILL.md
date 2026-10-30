@@ -57,19 +57,17 @@ dependencies = ["django>=4.2", ...]   # static list, lower bounds required
 [tool.setuptools_scm]
 version_scheme = "only-version"
 local_scheme = "no-local-version"
-# Only add fallback_version for repos with no published releases or that
-# are bind-mounted into Docker without a .git directory. Omit it once
-# the repo has real git tags (e.g. v1.0.0+) — a stale fallback like
-# "0.0.0.dev0" misleads builds on untagged commits.
-fallback_version = "0.0.0.dev0"
+fallback_version = "0.0.0"   # what shallow CI checkouts and Docker mounts without .git build as
+# If the repo carries org-wide named-release tags (release/verawood.1, ...), scope
+# git describe to the repo's own tags, or setuptools_scm fails to parse them:
+# git_describe_command = ["git", "describe", "--dirty", "--tags", "--long", "--match", "v[0-9]*"]
 
 [tool.setuptools.packages.find]
 include = ["<package>*"]
-exclude = ["*.tests", "*.tests.*"]   # exclude-package-data (below) strips data files
-                                     # but NOT .py test subpackages — need this too
-                                     # NOT "*tests" alone — fnmatch only matches names
-                                     # *ending* in "tests", so nested fixture packages
-                                     # like "<package>.tests.fixtures" still ship
+exclude = ["*tests*"]   # exclude-package-data (below) strips data files but NOT .py
+                        # test subpackages. Not "*tests" alone: fnmatch only matches
+                        # names *ending* in "tests", so "<package>.tests.fixtures"
+                        # would still ship. Diff the wheel against the last release.
 # where = ["src"] is added in Phase 4, once the package moves under src/
 
 [tool.setuptools.package-data]
@@ -103,9 +101,8 @@ show_missing = true
 exclude_lines = ["pragma: no cover", "def __repr__", "raise AssertionError",
     "raise NotImplementedError", "if __name__ == .__main__.:", "if TYPE_CHECKING:"]
 # Only add fail_under if the original .coveragerc had one — never invent a threshold
-
-[tool.coverage.html]
-directory = "htmlcov"
+# Carry over [html]/[xml] output paths only if .coveragerc had them: the Makefile's
+# coverage and diff_cover targets read htmlcov/ and coverage.xml at the root.
 ```
 
 **Key rules:**
@@ -115,6 +112,7 @@ directory = "htmlcov"
 - `dependencies` must be a static list — never `dynamic = ["dependencies"]`
 - Framework deps need a lower bound: `"django>=4.2"` (oldest tested version)
 - No upper bounds in `dependencies` (no `Django<6.0`): they become `Requires-Dist` on PyPI and block every downstream consumer from upgrading. Caps go in `[tool.uv].constraint-dependencies` via `edx_lint write_uv_constraints`. Compare against the last release's `Requires-Dist` (`https://pypi.org/pypi/<dist>/json`) and match it. (feanil on openedx-filters#381, openedx-core#704, auth-backends#444)
+- No direct-URL dependencies (`"pkg @ https://..."`) in `dependencies` or an extra: they land in `Requires-Dist` and PyPI rejects the upload, after PSR has already tagged and released. Use a plain `"pkg"` plus `[tool.uv.sources] pkg = { url = "..." }`. Grep the built METADATA for ` @ `.
 - `include-package-data`: pyproject's default is `true`, and with setuptools-scm that ships every git-tracked file under the package: READMEs, COPYING, `conf/locale/config.yaml`, test data (`exclude-package-data` didn't catch nested test dirs on openedx-events#590). If the old `setup.py` never set `include_package_data=True`, set `[tool.setuptools] include-package-data = false` and list real data files in `package-data`. Either way, diff the built wheel's file list against the last PyPI wheel before committing.
 - `authors = [{name = "Open edX Project", email = "oscm@openedx.org"}]` when the old author was edX/Open edX.
 - Framework classifiers should match the tested versions (e.g. `Framework :: Django :: 4.2`, `Framework :: Django :: 5.2`)
@@ -129,14 +127,12 @@ directory = "htmlcov"
   # Explicitly set the tag format (same as default).
   tag_format = "v{version}"
   ```
-- Leave `CHANGELOG.rst` as it is. Release notes go on the GitHub release (`changelog: "false"` in `release.yml`), so don't add a `.. changelog-insertion-marker` or `[tool.semantic_release.changelog]`, never delete old entries, and keep the file shipping in the sdist (feanil on DoneXBlock#388).
+- `CHANGELOG.rst` stops being updated: release notes go on the GitHub release (`changelog: "false"` in `release.yml`). Drop it from `readme` (README only) and add a note at the top, as openedx-ledger does: `.. DEPRECATED: ... see GitHub Releases`. Don't add a `.. changelog-insertion-marker` or `[tool.semantic_release.changelog]`, never delete old entries, and keep the file shipping in the sdist (feanil on DoneXBlock#388).
 
 The `build_command`, `allow_zero_version`, and `major_on_zero` keys under `[tool.semantic_release]` are added in Phase 3.
 
 **Handle `__version__` in `__init__.py`:**
-First `grep -r "__version__"` across the codebase. If nothing imports it, **remove it entirely** — cleanest option, no risk.
-
-Only keep it if something genuinely needs it at runtime. If so, use `importlib.metadata` without a `try/except` fallback — silent fallbacks mask uninstalled package errors:
+Keep it (don't remove what existed — downstream code and docs may read it), reading the version from `importlib.metadata` without a `try/except` fallback — silent fallbacks mask uninstalled package errors:
 ```python
 from importlib.metadata import version
 __version__ = version("distribution-name")  # use the [project].name, NOT __package__
@@ -160,6 +156,8 @@ __version__ = version("pkg-name")
 Update `docs/source/conf.py` if it reads `__version__` via regex — replace with `from importlib.metadata import version as get_version`.
 
 Delete `setup.py`, `setup.cfg`, and `.coveragerc` (coverage config now lives in `pyproject.toml`).
+
+If a reviewer asks for `MANIFEST.in` excludes (setuptools-scm puts every tracked file in the sdist), add them, then build the sdist and check nothing that shipped before stopped shipping.
 
 Update `MANIFEST.in` once the package moves to `src/` layout in Phase 4 — paths must use `src/<package>/static` etc., and drop any `include requirements/...` lines referencing the now-deleted `requirements/` directory.
 
@@ -201,7 +199,7 @@ conflicts = [[{group = "test"}, {group = "django42"}]]  # both pin Django
 - Do NOT add ruff unless the repo already uses it.
 - If `setup.cfg` had `[pycodestyle]`, migrate to `tox.ini` (pycodestyle reads tox.ini; pyproject.toml not supported).
 - If bumping a framework's version range drops support for an older Python, bump `requires-python` accordingly and remove that Python from the tox envlist and CI matrix.
-- edx-lint 6.2.0's PII checker crashes pylint on a `pylintrc` without `pii-terms`. If the fresh lock resolves 6.2+, regenerate it: `uv run --with edx-lint edx_lint write pylintrc`.
+- edx-lint 6.2.0's PII checker crashes pylint on a `pylintrc` without `pii-terms`. If the lock resolves 6.2+, regenerate it: `uv run --with edx-lint edx_lint write pylintrc`.
 - Declare every conflicting pair in `[tool.uv].conflicts` explicitly (each group that includes `test`, against `django42`), as openedx-ledger does. Otherwise uv derives them, the order varies by uv version, and `uv lock --check` passes or fails depending on who wrote the lock.
 
 ### Commands
@@ -234,7 +232,7 @@ Then delete `requirements/`.
 ```ini
 [tox]
 requires = tox-uv>=1
-envlist = py312-django{42,52}, quality, docs
+envlist = django{42,52}, quality, docs
 
 [testenv]
 runner = uv-venv-lock-runner
@@ -267,7 +265,9 @@ Keep `allowlist_externals = make` in every env that calls `make`.
 
 ### `Makefile`
 
-**Makefile targets must NOT use the `uv run` prefix** (openedx/public-engineering#506). The Makefile assumes the venv is already activated (e.g. via `uv sync` + direct `source .venv/bin/activate`, or because the caller already ran `uv run make ...`). `lint`/`test`/`docs`/`quality`/`pii_check` targets delegate to `tox -e <env>` instead of inlining commands — tox's `uv-venv-lock-runner` handles the group/venv selection per env, so duplicating that logic in the Makefile just gives you two places to keep in sync. If a repo already goes the other way (tox envs call `make`), keep it: feanil prefers tox calling the Makefile in the long run but doesn't want migration PRs to flip either direction (2026-09-28).
+**Makefile targets must NOT use the `uv run` prefix** (openedx/public-engineering#506). The Makefile assumes the venv is already activated (e.g. via `uv sync` + direct `source .venv/bin/activate`, or because the caller already ran `uv run make ...`). Don't change which way the Makefile and tox call each other: if the repo's targets inline commands, call `tox`, or are called by tox envs, keep that. feanil prefers tox calling the Makefile in the long run but doesn't want migration PRs to flip either direction (2026-09-28). The example below is one repo's shape, not a target to rewrite towards.
+
+Call Django management commands as `python manage.py ...`, not `./manage.py` (the file often isn't executable).
 
 The **only** exception is `uv run --with <pkg>` in the `upgrade` target. Do not add `uv run` anywhere else in the Makefile — in particular, never put it inside a target that tox itself invokes (e.g. `clean`'s `coverage erase`): `uv run` re-syncs default dependency groups, which corrupts the Django version matrix when it runs inside an already-selected tox env.
 
@@ -367,11 +367,8 @@ Other CI rules:
 [tool.semantic_release]
 # No version_toml — version is dynamic via setuptools-scm
 build_command = "python -m pip install --upgrade build && SETUPTOOLS_SCM_PRETEND_VERSION=$NEW_VERSION python -m build"
-# Only add these two lines if the repo is currently on 0.x — they prevent
-# PSR from auto-bumping to 1.0.0 on a breaking change while still pre-1.0.
-# Omit them entirely once the repo is at v1.0.0+.
-# allow_zero_version = true
-# major_on_zero = false
+major_on_zero = false
+allow_zero_version = true
 ```
 
 `build_command` must use `python -m build`, not `uv build` — PSR's action environment has no uv.
@@ -526,7 +523,7 @@ jobs:
 
 Skip if `src/<package>/` already exists.
 
-Also skip it if anything outside the repo reads files by their in-repo path. Check openedx-translations first: its extraction workflow skips `*/src/*`, and its `transifex.yml` hard-codes paths like `translations/<repo>/<package>/conf/locale/` (edx-bulk-grades#179 and completion#466 stayed flat for this reason). Then `gh search code "<repo>/master/<package>/" --owner openedx` for raw-file fetches. Say in the PR why Phase 4 was skipped.
+openedx-translations doesn't block the move: its extraction job is being changed to strip `src/` centrally (openedx/openedx-translations#82365), and `transifex.yml` stays as is. Do check other outside code that fetches in-repo paths: `gh search code "<repo>/master/<package>/" --owner openedx`. If that finds something, skip Phase 4 and say why in the PR.
 
 1. `git mv <package>/ src/<package>/`
 2. `pyproject.toml` — add `where = ["src"]` to `[tool.setuptools.packages.find]`
@@ -556,6 +553,14 @@ Also skip it if anything outside the repo reads files by their in-repo path. Che
 
 ---
 
+## Keeping a long-open PR mergeable
+
+The requirements bot (`make upgrade` editing `requirements/*.txt`) and Dependabot (`setup-python` bumps in workflows you rewrote) cause conflicts, often across a whole batch at once. Merge rather than rebase once there are review threads:
+1. `git merge origin/<default>`; `git rm` the files the migration deleted, keep the deleted `pypi-publish.yml` deleted.
+2. Resolve conflicting workflow *hunks* to your side; don't take the whole file, which drops the default branch's unrelated bumps in it.
+3. Carry any new upstream code into `src/` by hand.
+4. Reseed or `uv lock --check` (see Phase 2), push with `--force-with-lease`, and confirm the PR's head SHA is what you pushed.
+
 ## Committing
 
 One commit per phase, conventional format:
@@ -577,6 +582,7 @@ diff <(unzip -p old.whl '*.dist-info/METADATA' | grep ^Requires-Dist | sort) \
 tar tzf dist/*.tar.gz | grep -iE 'CHANGELOG|README|LICENSE'
 uvx twine check dist/*
 ```
+Then a PSR dry run, on a local branch named like the default branch, to confirm it finds the latest `v` tag and computes the next version: `uvx --from python-semantic-release semantic-release --noop version --print`.
 The file lists should match except for differences you can explain in the PR (e.g. test files that shouldn't have shipped). Diff the lists, not just the counts.
 
 Push to fork, open PR against the **upstream repo** (not the fork):
@@ -596,14 +602,14 @@ Phase 1
 [ ] License classifier removed (PEP 639: SPDX license = conflicts with License :: classifier)
 [ ] license uses AGPL-3.0-only or AGPL-3.0-or-later (matching the original classifier) — never bare "AGPL-3.0"
 [ ] license-files includes NOTICE if the repo has one
-[ ] [tool.setuptools.packages.find] excludes test subpackages: exclude = ["*.tests", "*.tests.*"]
+[ ] [tool.setuptools.packages.find] excludes test subpackages: exclude = ["*tests*"]
 [ ] No upper bounds in [project].dependencies; Requires-Dist matches the last PyPI release
 [ ] include-package-data set so the wheel's file list matches the last PyPI wheel
 [ ] authors = Open edX Project <oscm@openedx.org> (if the old author was edX/Open edX)
-[ ] __version__: removed entirely if unused; if kept, use importlib.metadata without try/except
+[ ] __version__ kept, read via importlib.metadata without try/except
 [ ] setup.py / setup.cfg / .coveragerc deleted
 [ ] fail_under only if original .coveragerc had it
-[ ] CHANGELOG.rst left as-is: no insertion marker, no deleted entries, still in the sdist
+[ ] CHANGELOG.rst dropped from readme with a DEPRECATED note at the top; no insertion marker, no deleted entries, still in the sdist
 [ ] A v-tag exists for the latest PyPI version (checked live); tag_format = "v{version}" optional
 
 Phase 2
@@ -614,7 +620,7 @@ Phase 2
 [ ] uv.lock seeded from the base branch's requirements/*.txt; each group's uv export diffed against its .txt (only explainable differences)
 [ ] requirements/ deleted
 [ ] tox.ini: tox-uv>=1, uv-venv-lock-runner, dependency_groups
-[ ] Makefile: NO uv run prefix anywhere except `uv run --with <pkg>` in upgrade; no uv sync except in requirements; quality/test/docs targets delegate to `tox -e <env>` (keep a repo's existing tox→make direction); clean uses bare `coverage erase`
+[ ] Makefile: NO uv run prefix anywhere except `uv run --with <pkg>` in upgrade; no uv sync except in requirements; Makefile↔tox calling direction unchanged; manage.py called as `python manage.py`; clean uses bare `coverage erase`
 [ ] pylintrc regenerated if the lock resolves edx-lint 6.2+
 [ ] CI: setup-uv SHA-pinned, no setup-python, npm install (if JS assets), --locked on every uv sync / uv run in every workflow, no fetch-depth: 0 on test checkouts
 [ ] CI: an existing concurrency block uses sample-plugin's pull_request/run_id form once workflow_call: is added
@@ -622,7 +628,7 @@ Phase 2
 [ ] pypi-publish.yml untouched (deleted in Phase 3)
 
 Phase 3
-[ ] [tool.semantic_release]: build_command (python -m build); allow_zero_version + major_on_zero ONLY for 0.x repos (omit for 1.x+)
+[ ] [tool.semantic_release]: tag_format, build_command (python -m build), major_on_zero = false, allow_zero_version = true
 [ ] release.yml fetched fresh from openedx/sample-plugin and structurally diffed against it (job/key order, comments, `run: |` vs `run:`) — monorepo-only lines (directory:, packages-dir:, multi-path dist, npm/tutor jobs) excepted
 [ ] release.yml: job calling ci.yml is named run_ci, no secrets: inherit, no permissions block on it
 [ ] release.yml: checkout step named "Setup | Checkout Repository on Release Branch", no fetch-depth: 0; reset step named "Setup | Force release branch to be at workflow sha" using `run: |`
@@ -636,7 +642,7 @@ Phase 3
 [ ] PR template, README and docs no longer describe manual version bumps/tags/releases or a self-made virtualenv
 
 Phase 4
-[ ] Nothing external reads in-repo paths (openedx-translations transifex.yml, raw-file fetches); otherwise skip and say why
+[ ] No outside raw-file fetches of in-repo paths (`gh search code`); otherwise skip and say why (openedx-translations is not a blocker)
 [ ] Package moved to src/<package>/
 [ ] pyproject.toml: where = ["src"]
 [ ] pyproject.toml: [tool.coverage.run] source_pkgs (not source) — required so default-label test discovery working (or not) doesn't silently zero out coverage
@@ -648,7 +654,7 @@ Phase 4
 [ ] uv run tox -e quality passes
 
 Before pushing
-[ ] uv lock --check clean; wheel file list and Requires-Dist diffed against the last PyPI release; sdist still has CHANGELOG/README/LICENSE; twine check passes
+[ ] uv lock --check clean; PSR --noop dry run finds the latest v tag; wheel file list and Requires-Dist diffed against the last PyPI release; sdist still has CHANGELOG/README/LICENSE; twine check passes
 
 Review rounds
 [ ] No unrequested "for consistency" or "just in case" changes in the latest commits
